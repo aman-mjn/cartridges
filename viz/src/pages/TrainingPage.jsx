@@ -22,17 +22,11 @@ function TrainingPage() {
     }
   }
 
-  // W&B state - entity and project are now configured on server via env vars
-  const [wandbRuns, setWandbRuns] = useState(() => loadFromStorage('wandbRuns', []))
-  const [loadingWandb, setLoadingWandb] = useState(false)
-  const [wandbError, setWandbError] = useState(null)
-  const [wandbPage, setWandbPage] = useState(0)
-  const [wandbHasMore, setWandbHasMore] = useState(true)
-  const [wandbTotalCount, setWandbTotalCount] = useState(0)
-  const [wandbFilters, setWandbFilters] = useState(() => loadFromStorage('wandbFilters', {
-    tag: '',
-    run_id: ''
-  }))
+  // Local runs (from outputs) instead of W&B
+  const [localRuns, setLocalRuns] = useState([])
+  const [loadingRuns, setLoadingRuns] = useState(false)
+  const [runsError, setRunsError] = useState(null)
+  const [outputsRoot, setOutputsRoot] = useState(() => loadFromStorage('outputsRoot', './outputs'))
   
   // Dashboard state with persistence
   const [dashboards, setDashboards] = useState(() => loadFromStorage('dashboards', []))
@@ -53,15 +47,15 @@ function TrainingPage() {
   const [loadingSliceMetrics, setLoadingSliceMetrics] = useState(false)
   const [selectedSlicesForPlot, setSelectedSlicesForPlot] = useState(new Set())
 
+  // Local metrics state
+  const [metrics, setMetrics] = useState([])
+  const [evalMetrics, setEvalMetrics] = useState([])
+
   // Save state to localStorage whenever it changes
 
   useEffect(() => {
-    saveToStorage('wandbRuns', wandbRuns)
-  }, [wandbRuns])
-
-  useEffect(() => {
-    saveToStorage('wandbFilters', wandbFilters)
-  }, [wandbFilters])
+    saveToStorage('outputsRoot', outputsRoot)
+  }, [outputsRoot])
 
   useEffect(() => {
     saveToStorage('dashboards', dashboards)
@@ -141,68 +135,28 @@ function TrainingPage() {
     return uniqueData
   }
 
-  // W&B functionality using backend API
-  const fetchWandbRuns = async (page = 0, append = false) => {
-    setLoadingWandb(true)
-    setWandbError(null)
-    
+  const fetchLocalRuns = async () => {
+    setLoadingRuns(true)
+    setRunsError(null)
     try {
-      // Get dashboard filters if a dashboard is selected
-      const selectedDashboardData = dashboards.find(d => d.name === selectedDashboard)
-      const dashboardFilters = selectedDashboardData ? selectedDashboardData.filters : {}
-      
-      console.log('Fetching W&B runs with:', { selectedDashboard, dashboardFilters, dashboards: dashboards.length, page })
-      
-      const response = await fetch('/api/wandb/runs', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          filters: wandbFilters,
-          dashboard_filters: dashboardFilters,
-          page: page,
-          per_page: 8
-        })
-      })
-      
-      const data = await response.json()
-      
-      if (data.error) {
-        throw new Error(data.error)
-      }
-      
-      if (append) {
-        setWandbRuns(prevRuns => [...prevRuns, ...data.runs])
-      } else {
-        setWandbRuns(data.runs)
-        setWandbPage(0)
-      }
-      
-      setWandbHasMore(data.has_more || false)
-      setWandbTotalCount(data.total || 0)
-      setWandbPage(page)
-    } catch (error) {
-      console.error('Failed to fetch W&B runs:', error)
-      setWandbError(`Failed to fetch runs: ${error.message}`)
+      const res = await fetch(`/api/local/runs?root=${encodeURIComponent(outputsRoot)}`)
+      const data = await res.json()
+      if (data.error) throw new Error(data.error)
+      setLocalRuns(data.runs || [])
+    } catch (e) {
+      setRunsError(e.message)
     } finally {
-      setLoadingWandb(false)
+      setLoadingRuns(false)
     }
   }
 
   // Load more runs
-  const loadMoreRuns = async () => {
-    const nextPage = wandbPage + 1
-    await fetchWandbRuns(nextPage, true)
-  }
+  const loadMoreRuns = async () => {}
 
-  // Fetch runs when dashboard selection changes OR when dashboards are first loaded
+  // Fetch local runs initially and when root changes
   useEffect(() => {
-    if (dashboards.length > 0) {
-      console.log('useEffect triggered for W&B runs fetch:', { selectedDashboard, dashboardsLength: dashboards.length })
-      fetchWandbRuns()
-    }
-  }, [selectedDashboard, dashboards])
+    fetchLocalRuns()
+  }, [outputsRoot])
 
   // Fetch available dashboards
   const fetchDashboards = async () => {
@@ -234,20 +188,10 @@ function TrainingPage() {
 
   // Debug log on mount to see restored state
   useEffect(() => {
-    console.log('TrainingPage mounted with restored state:', {
-      selectedDashboard,
-      dashboardsCount: dashboards.length,
-      runsCount: wandbRuns.length
-    })
+    console.log('TrainingPage mounted')
   }, [])
 
-  // Auto-fetch runs on mount if we have all the required data persisted
-  useEffect(() => {
-    if (dashboards.length > 0 && wandbRuns.length === 0 && selectedDashboard) {
-      console.log('Auto-fetching runs on mount with persisted data')
-      fetchWandbRuns()
-    }
-  }, [])  // Only run on mount
+  // no-op
 
   // Auto-analyze restored selected run when we have all the data
   useEffect(() => {
@@ -271,10 +215,6 @@ function TrainingPage() {
     setSelectedTable(null)
     setSelectedTableData(null)  // Clear previous table data
     setSelectedTableExample(null)
-    setSliceMetricsOverTime([])  // Clear previous slice metrics
-    setTableSlices([])  // Clear previous table slices
-    setActiveSlices(new Set())  // Clear active slices
-    setSelectedSlicesForPlot(new Set())  // Clear selected slices for plot
     
     try {
       const response = await fetch('/api/dashboard/analyze', {
@@ -492,18 +432,69 @@ function TrainingPage() {
       if (!plotRef.current || !plot) return
       
       const traces = []
-      
-      // Main plot trace
-      const mainTrace = {
-        x: plot.data.map(d => d[plot.x_col]),
-        y: plot.data.map(d => d[plot.y_col]),
-        type: 'scatter',
-        mode: 'lines+markers',
-        name: plot.plot_name,
-        line: { color: '#3b82f6', width: 2 },
-        marker: { color: '#3b82f6', size: 6 }
+
+      // Prepare numeric x/y pairs and filter invalids
+      const xy = (plot.data || [])
+        .map(d => ({ x: Number(d[plot.x_col]), y: Number(d[plot.y_col]) }))
+        .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y))
+
+      const xVals = xy.map(p => p.x)
+      const yVals = xy.map(p => p.y)
+
+      const isTrainingSeries = typeof plot.id === 'string' && plot.id.startsWith('local/')
+
+      if (isTrainingSeries) {
+        // Raw data as markers (actual points)
+        const mainTrace = {
+          x: xVals,
+          y: yVals,
+          type: 'scatter',
+          mode: 'markers',
+          name: 'Raw',
+          marker: { color: '#60a5fa', size: 5, opacity: 0.7 }
+        }
+        traces.push(mainTrace)
+      } else {
+        // For eval/replay, show lines+markers without smoothing
+        const mainTrace = {
+          x: xVals,
+          y: yVals,
+          type: 'scatter',
+          mode: 'lines+markers',
+          name: plot.plot_name,
+          line: { color: '#3b82f6', width: 2 },
+          marker: { color: '#3b82f6', size: 6 }
+        }
+        traces.push(mainTrace)
       }
-      traces.push(mainTrace)
+
+      // Smoothed overlay using moving average
+      const movingAverage = (values, windowSize) => {
+        const result = []
+        let sum = 0
+        const queue = []
+        for (let i = 0; i < values.length; i++) {
+          const v = values[i]
+          queue.push(v)
+          sum += v
+          if (queue.length > windowSize) sum -= queue.shift()
+          result.push(sum / queue.length)
+        }
+        return result
+      }
+      if (isTrainingSeries && yVals.length > 2) {
+        const windowSize = Math.max(5, Math.floor(yVals.length * 0.05))
+        const ySmooth = movingAverage(yVals, windowSize)
+        const smoothTrace = {
+          x: xVals,
+          y: ySmooth,
+          type: 'scatter',
+          mode: 'lines',
+          name: 'Smoothed',
+          line: { color: '#1f2937', width: 3 }
+        }
+        traces.push(smoothTrace)
+      }
       
       // Add slice traces if available and selected
       if (sliceMetrics && selectedSlices && selectedSlices.size > 0) {
@@ -615,41 +606,19 @@ function TrainingPage() {
           </div>
         </div>
 
-        {/* W&B Configuration */}
+        {/* Outputs Root */}
         <div className="p-4">
           <div className="space-y-4">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                Filter by Tag
+                Outputs Root
               </label>
               <input
                 type="text"
-                value={wandbFilters.tag}
-                onChange={(e) => setWandbFilters({...wandbFilters, tag: e.target.value})}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    fetchWandbRuns()
-                  }
-                }}
-                placeholder="e.g., generate, paper"
-                className="w-full p-2 border border-gray-300 rounded text-sm"
-              />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Filter by Run ID/Name
-              </label>
-              <input
-                type="text"
-                value={wandbFilters.run_id}
-                onChange={(e) => setWandbFilters({...wandbFilters, run_id: e.target.value})}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    fetchWandbRuns()
-                  }
-                }}
-                placeholder="e.g., longhealth, p10"
+                value={outputsRoot}
+                onChange={(e) => setOutputsRoot(e.target.value)}
+                onBlur={fetchLocalRuns}
+                placeholder="./outputs"
                 className="w-full p-2 border border-gray-300 rounded text-sm"
               />
             </div>
@@ -657,32 +626,32 @@ function TrainingPage() {
         </div>
 
         {/* Error Display */}
-        {wandbError && (
+        {runsError && (
           <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-            <div className="text-sm text-red-800">{wandbError}</div>
+            <div className="text-sm text-red-800">{runsError}</div>
           </div>
         )}
 
         {/* Loading State */}
-        {loadingWandb && (
+        {loadingRuns && (
           <div className="flex flex-col items-center justify-center py-8">
             <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mb-3"></div>
-            <div className="text-sm text-gray-600">Fetching runs from W&B...</div>
+            <div className="text-sm text-gray-600">Scanning local outputs...</div>
           </div>
         )}
 
-        {/* W&B Runs */}
-        {(wandbRuns.length > 0 || (!loadingWandb && dashboards.length > 0)) && (
+        {/* Local Runs */}
+        {(localRuns.length > 0 || (!loadingRuns && dashboards.length > 0)) && (
           <div className="flex-1 flex flex-col min-h-0">
             <div className="flex items-center justify-between mb-3 px-4">
               <h3 className="text-sm font-medium text-gray-700">
-                Recent Runs ({wandbRuns.length}{wandbTotalCount > 0 ? ` of ${wandbTotalCount}` : ''})
+                Local Runs ({localRuns.length})
               </h3>
               <button
-                onClick={fetchWandbRuns}
-                disabled={loadingWandb}
+                onClick={fetchLocalRuns}
+                disabled={loadingRuns}
                 className={`px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 disabled:bg-gray-50 disabled:text-gray-400 text-gray-700 rounded transition-colors ${
-                  loadingWandb ? 'animate-spin' : ''
+                  loadingRuns ? 'animate-spin' : ''
                 }`}
                 title="Refresh runs"
               >
@@ -690,7 +659,7 @@ function TrainingPage() {
               </button>
             </div>
             <div className="space-y-2 flex-1 overflow-y-auto px-4">
-              {wandbRuns.length > 0 ? wandbRuns.map((run) => (
+              {localRuns.length > 0 ? localRuns.map((run) => (
                 <div
                   key={run.id}
                   className={`p-3 rounded-lg cursor-pointer transition-all border ${
@@ -699,88 +668,21 @@ function TrainingPage() {
                   onClick={() => analyzeRun(run)}
                 >
                   <div className="flex items-center justify-between mb-2">
-                    <div className="font-medium text-sm text-gray-800 truncate">
-                      {run.name}
-                    </div>
-                    <div className={`px-2 py-1 text-xs rounded-full ${
-                      run.state === 'running' ? 'bg-blue-100 text-blue-800' :
-                      run.state === 'finished' ? 'bg-green-100 text-green-800' :
-                      run.state === 'failed' ? 'bg-red-100 text-red-800' :
-                      run.state === 'crashed' ? 'bg-red-100 text-red-800 bg-red-200' :
-                      'bg-gray-100 text-gray-800'
-                    }`}>
-                      {run.state}
-                    </div>
+                    <div className="font-medium text-sm text-gray-800 truncate">{run.name}</div>
+                    <div className="px-2 py-1 text-xs rounded-full bg-gray-100 text-gray-800">local</div>
                   </div>
-                  <button
-                    className="text-xs text-gray-500 mb-1 hover:text-gray-700 hover:bg-gray-100 px-2 py-1 rounded transition-colors cursor-pointer text-left"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      navigator.clipboard.writeText(run.id).then(() => {
-                        // Optional: Add visual feedback here
-                        const button = e.target
-                        const originalText = button.textContent
-                        button.textContent = 'Copied!'
-                        setTimeout(() => {
-                          button.textContent = originalText
-                        }, 1000)
-                      }).catch(err => {
-                        console.error('Failed to copy: ', err)
-                      })
-                    }}
-                    title="Click to copy ID"
-                  >
-                    ID: {run.id}
-                  </button>
-                  {run.tags && run.tags.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mb-2">
-                      {run.tags.slice(0, 3).map((tag, idx) => (
-                        <span key={idx} className="px-2 py-1 bg-purple-100 text-purple-700 text-xs rounded">
-                          {tag}
-                        </span>
-                      ))}
-                      {run.tags.length > 3 && (
-                        <span className="text-xs text-gray-500">+{run.tags.length - 3} more</span>
-                      )}
-                    </div>
-                  )}
-                  <div className="text-xs text-gray-400">
-                    Created: {new Date(run.createdAt).toLocaleDateString()}
+                  <div className="text-xs text-gray-500 mb-1">
+                    Path: {run.path}
                   </div>
-                  <a 
-                    href={run.url} 
-                    target="_blank" 
-                    rel="noopener noreferrer"
-                    className="text-xs text-blue-600 hover:text-blue-800 mt-1 inline-block"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    View in W&B →
-                  </a>
+                  <div className="text-xs text-gray-400">Updated: {new Date(run.createdAt).toLocaleString()}</div>
                 </div>
               )) : (
                 <div className="text-center text-gray-500 py-8">
-                  <p className="text-sm">No runs found.</p>
-                  <p className="text-xs mt-1">Use filters above and click refresh to fetch runs.</p>
+                  <p className="text-sm">No local runs found.</p>
+                  <p className="text-xs mt-1">Set your outputs root and click refresh.</p>
                 </div>
               )}
             </div>
-            
-            {/* Load More Button */}
-            {wandbRuns.length > 0 && wandbHasMore && (
-              <div className="px-4 pb-4">
-                <button
-                  onClick={loadMoreRuns}
-                  disabled={loadingWandb}
-                  className={`w-full px-3 py-2 text-sm rounded border transition-colors ${
-                    loadingWandb 
-                      ? 'bg-gray-50 border-gray-200 text-gray-400 cursor-not-allowed'
-                      : 'bg-white border-gray-300 text-gray-700 hover:bg-gray-50 hover:border-gray-400'
-                  }`}
-                >
-                  {loadingWandb ? 'Loading...' : 'Load More'}
-                </button>
-              </div>
-            )}
           </div>
         )}
 
@@ -1226,7 +1128,7 @@ function TrainingPage() {
             {loadingDashboard && (
               <div className="flex flex-col items-center justify-center py-12 text-center text-gray-600">
                 <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mb-4"></div>
-                <p>Loading run from W&B...</p>
+                <p>Loading run...</p>
               </div>
             )}
           </div>
@@ -1240,7 +1142,7 @@ function TrainingPage() {
           ) : (
             <div className="flex flex-col items-center justify-center text-center text-gray-600 flex-1 p-4">
               <h2 className="text-xl font-semibold mb-2 text-gray-800">Select a run to analyze</h2>
-              <p>Choose a dashboard and click on a W&B run to begin analysis.</p>
+              <p>Choose a dashboard and click on a local run to begin analysis.</p>
             </div>
           )
         )}

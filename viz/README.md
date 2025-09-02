@@ -7,12 +7,10 @@ We encourage you to adapt the interface to your needs, we've found Claude Code t
 
 ## Setup
 
-**Note:** The following works for us with node --version `v24.4.0`. If you're running into issues installing dependencies, or with the frontend, try using this version.
-
 1. Install the dependencies:
 ```bash
 cd viz
-uv pip install -r requirements.txt
+pip install -r requirements.txt
 npm install
 ```
 
@@ -28,7 +26,7 @@ You may need to pick a different port if the default 8001 is already in use.
 Make sure to set the `VITE_API_TARGET` to the port of the server.
 
 ```bash
-VITE_API_TARGET=http://localhost:3000 npm run dev
+VITE_API_TARGET=http://localhost:8080 npm run dev
 ```
 
 ---

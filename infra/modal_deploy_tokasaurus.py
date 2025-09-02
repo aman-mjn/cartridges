@@ -15,15 +15,14 @@ root = Path(__file__).parent.parent.parent
 # --- BEGIN ARGS ---
 PORT = 8080
 BRANCH = os.environ.get("BRANCH", "main")
-MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.2-3B-Instruct") 
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507") 
 DP_SIZE = int(os.environ.get("DP_SIZE", 1))
 PP_SIZE = int(os.environ.get("PP_SIZE", 1))
 MAX_TOPK_LOGPROBS = int(os.environ.get("MAX_TOPK_LOGPROBS", 20))
 GPU_TYPE: Literal["H100", "H200", "B200", "A100-80GB"] = os.environ.get("GPU_TYPE", "H100")
 MIN_CONTAINERS = int(os.environ.get("MIN_CONTAINERS", 0))
-MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", 32))
+MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", 8))
 ALLOW_CONCURRENT_INPUTS = int(os.environ.get("ALLOW_CONCURRENT_INPUTS", 32))
-SECRETS = os.environ.get("SECRETS", "sabri-api-keys")
 # --- END ARGS ---
 
 MINUTES = 60  # seconds
@@ -44,7 +43,7 @@ if BRANCH != "main":
 image = image.run_commands("cd /root/tokasaurus && git pull", force_build=True)
 image = image.env({
     "MODEL_NAME": MODEL_NAME, 
-    "MAX_COMPLETION_TOKENS": MAX_COMPLETION_TOKENS, 
+    "MAX_COMPLETION_TOKENS": str(2048), 
     "MAX_TOPK_LOGPROBS": str(MAX_TOPK_LOGPROBS),
     "DP_SIZE": str(DP_SIZE),
     "PP_SIZE": str(PP_SIZE),
@@ -87,7 +86,6 @@ def wait_for_port(port, host="localhost", timeout=60.0):
     scaledown_window=1 * MINUTES,
     min_containers=MIN_CONTAINERS,
     max_containers=MAX_CONTAINERS,
-    secrets=[modal.Secret.from_name(SECRETS)],
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/flashinfer": flashinfer_cache_vol,

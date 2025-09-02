@@ -1,4 +1,3 @@
-import wandb
 import pandas as pd
 from dashboards.base import Dashboard, registry, Slice
 

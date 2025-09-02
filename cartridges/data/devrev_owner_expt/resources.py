@@ -68,12 +68,12 @@ class RoutingResource(Resource):
 
 
 PROMPTS = [
-    "Ask: What all RPCs are there in the repository? Require listing every RPC name. Ensure the question is answerable from the provided context.",
-    "Ask: For one specific RPC in the repository, who is its author and who is its reviewer? Require naming both and the RPC. Ensure the question is answerable from the provided context.",
-    "Ask: For one specific RPC in the repository, what does it do based on its description? Require naming the RPC and summarizing the description. Ensure the question is answerable from the provided context.",
-    "Ask: How many RPCs are in the repository, and what are their names? Ensure the question is answerable from the provided context.",
-    "Ask: List all unique authors in the repository along with the count of RPCs attributed to each. Ensure the question is answerable from the provided context.",
-    "Ask: List all unique reviewers in the repository along with the count of RPCs they reviewed. Ensure the question is answerable from the provided context."
+    "Generate a question related to what all RPCs are there in the repository? Require listing every RPC name. Ensure the question is answerable from the provided context and include the repo name in the question. Answer only with the question, do not include any other text.",
+    "Generate a question related to one specific RPC in the repository, who is its author and who is its reviewer? Require naming both and the RPC. Ensure the question is answerable from the provided context. Answer only with the question, do not include any other text.",
+    "Generate a question related to one specific RPC in the repository, what does it do based on its description? Require naming the RPC and summarizing the description. Ensure the question is answerable from the provided context and include the repo name in the question. Answer only with the question, do not include any other text.",
+    "Generate a question related to how many RPCs are in the repository, and what are their names? Ensure the question is answerable from the provided context and include the repo name in the question. Answer only with the question, do not include any other text.",
+    "Generate a question related to list all unique authors in the repository along with the count of RPCs attributed to each. Ensure the question is answerable from the provided context and include the repo name in the question. Answer only with the question, do not include any other text.",
+    "Generate a question related to list all unique reviewers in the repository along with the count of RPCs they reviewed. Ensure the question is answerable from the provided context. Answer only with the question, do not include any other text."
 ]
 
 if __name__ == "__main__":

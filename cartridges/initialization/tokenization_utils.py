@@ -53,6 +53,7 @@ MODEL_TO_SYSTEM_PROMPT_TOKENIZER = {
     "Qwen/Qwen3-0.6b": qwen_tokenize_data_into_system_prompt,
     "Qwen/Qwen3-1.7b": qwen_tokenize_data_into_system_prompt,
     "Qwen/Qwen3-4b": qwen_tokenize_data_into_system_prompt,
+    "Qwen/Qwen3-4b-Instruct-2507": qwen_tokenize_data_into_system_prompt,
     "Qwen/Qwen3-8b": qwen_tokenize_data_into_system_prompt,
     "Qwen/Qwen3-14b": qwen_tokenize_data_into_system_prompt,
     "Qwen/Qwen3-32b": qwen_tokenize_data_into_system_prompt,

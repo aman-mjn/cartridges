@@ -26,7 +26,7 @@ from cartridges.data.devrev_owner_expt.resources import RoutingResource
 # client = OpenAIClient(config)
 
 client = TokasaurusClient.Config(
-    url="http://127.0.0.1:8005",
+    url="https://pratham1002--toka-qwen3-4b-2507-1xh100-serve.modal.run",
     model_name="Qwen/Qwen3-4B-Instruct-2507",
 )
 
@@ -48,9 +48,9 @@ config = SynthesizeConfig(
         max_completion_tokens_a=2048,
     ),
     output_dir=os.environ.get("CARTRIDGES_OUTPUT_DIR", "."),
-    num_samples=512, # total number of question-answer pairs to be generated
+    num_samples=16384, # total number of question-answer pairs to be generated
     batch_size=1, # number of question-answer pairs to be generated in parallel
-    max_num_batches_in_parallel=30*8,  # MAX SCALE: 8 pods x 8 concurrent x 32 batch_size = 2048 conversations parallel (8 iterations total)
+    max_num_batches_in_parallel=32*8*2,  # MAX SCALE: 8 pods x 8 concurrent x 32 batch_size = 2048 conversations parallel (8 iterations total)
     name=FormatStringVariable(f"{Path(__file__).stem}_n{ '{num_samples}' }"),
     run_id=FormatStringVariable("{name}"),
     wandb=WandBConfig(

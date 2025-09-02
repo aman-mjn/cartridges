@@ -27,6 +27,7 @@ CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*').split(',')
 HOST = os.getenv('HOST', '0.0.0.0')
 PORT = int(os.getenv('PORT', '8000'))
 RELOAD = os.getenv('RELOAD', 'false').lower() == 'true'
+OUTPUTS_ROOT = os.getenv('CARTRIDGES_OUTPUT_DIR', '/root/cartridges-v2/outputs')
 
 # CORS middleware configuration
 if CORS_ENABLED:
@@ -85,54 +86,37 @@ def serialize_training_example(example, tokenizer: AutoTokenizer=None, include_l
     try:
         messages = []
         for msg in example.messages:
-            
             token_ids = msg.token_ids.tolist() if hasattr(msg.token_ids, "tolist") else msg.token_ids
-
-            if token_ids is not None and tokenizer is not None:
-                token_strs = [tokenizer.decode([token_id], skip_special_tokens=False) for token_id in token_ids]
-            else:
-                token_strs = None
-
             message_data = {
                 'content': msg.content,
                 'role': msg.role,
                 'token_ids': token_ids,
-                'token_strs': token_strs,
+                'token_strs': [tokenizer.decode([token_id], skip_special_tokens=False) for token_id in token_ids] if tokenizer else None,
                 'top_logprobs': None
             }
             
             # Handle logprobs if they exist and are requested
-            if (
-                include_logprobs and 
-                hasattr(msg, 'top_logprobs') and 
-                msg.top_logprobs is not None and 
-                token_ids is not None 
-            ):
+            if include_logprobs and hasattr(msg, 'top_logprobs') and msg.top_logprobs is not None:
                 # Use the original structure to get all top-k alternatives for each position
                 top_logprobs_matrix = msg.top_logprobs  # This is the original TopLogprobs object
                 
-                # Add null checks for the internal arrays before attempting to iterate
-                if (top_logprobs_matrix.token_idx is not None and 
-                    top_logprobs_matrix.token_id is not None and 
-                    top_logprobs_matrix.logprobs is not None):
-                    
-                    # Create list of lists, same length as token_ids
-                    token_idx_to_logprobs = [[] for _ in range(len(token_ids))]
-                    
-                    for token_idx, token_id, logprobs in zip(top_logprobs_matrix.token_idx, top_logprobs_matrix.token_id, top_logprobs_matrix.logprobs):
-                        token_idx_to_logprobs[token_idx].append({
-                            'token_id': int(token_id),
-                            "token_str": tokenizer.decode([token_id], skip_special_tokens=False) if tokenizer else None,
-                            'logprob': float(logprobs)
-                        })
-                                
-                    result = []
-                    for token_idx, logprobs in enumerate(token_idx_to_logprobs):
-                        # Sort by logprob (highest first)
-                        logprobs.sort(key=lambda x: x['logprob'], reverse=True)
-                        result.append(logprobs)
-                    
-                    message_data['top_logprobs'] = result
+                # Create list of lists, same length as token_ids
+                token_idx_to_logprobs = [[] for _ in range(len(token_ids))]
+                
+                for token_idx, token_id, logprobs in zip(top_logprobs_matrix.token_idx, top_logprobs_matrix.token_id, top_logprobs_matrix.logprobs):
+                    token_idx_to_logprobs[token_idx].append({
+                        'token_id': int(token_id),
+                        "token_str": tokenizer.decode([token_id], skip_special_tokens=False) if tokenizer else None,
+                        'logprob': float(logprobs)
+                    })
+                            
+                result = []
+                for token_idx, logprobs in enumerate(token_idx_to_logprobs):
+                    # Sort by logprob (highest first)
+                    logprobs.sort(key=lambda x: x['logprob'], reverse=True)
+                    result.append(logprobs)
+                
+                message_data['top_logprobs'] = result
             
             messages.append(message_data)
         
@@ -510,163 +494,74 @@ def _get_tokenizer(dataset_path: str):
 
 @app.get("/api/dashboards")
 def get_dashboards():
-    """Get available dashboards from the registry."""
-    try:
-        # Import dashboard registry with proper error handling
-        import importlib
-        import os
-        
-        # Get absolute path to dashboards directory
-        dashboards_dir = os.path.join(os.path.dirname(__file__), 'dashboards')
-        dashboards_dir = os.path.abspath(dashboards_dir)
-        
-        print(f"Looking for dashboards in: {dashboards_dir}")
-        print(f"Dashboard directory exists: {os.path.exists(dashboards_dir)}")
-        print(f"Files in directory: {os.listdir(dashboards_dir) if os.path.exists(dashboards_dir) else 'None'}")
-        
-        # Import base registry first
-        try:
-            print(f"Python sys.path: {sys.path}")
-            print(f"Current working directory: {os.getcwd()}")
-            print(f"__file__ directory: {os.path.dirname(__file__)}")
-            print(f"Absolute path to dashboards: {os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'dashboards'))}")
-            
-            from dashboards.base import registry
-            print(f"Successfully imported registry, has {len(registry.dashboards)} dashboards")
-        except ImportError as e:
-            print(f"Failed to import base: {e}")
-            return {'error': f'Failed to import base: {str(e)}'}
-        
-        # Dynamically import all dashboard modules in the directory
-        if os.path.exists(dashboards_dir):
-            for filename in os.listdir(dashboards_dir):
-                if filename.endswith('.py') and filename not in ['__init__.py', 'base.py']:
-                    module_name = filename[:-3]  # Remove .py extension
-                    print(f"Attempting to import dashboard module: {module_name}")
-                    
-                    try:
-                        # Import the module - this should register any dashboards it contains
-                        importlib.import_module(f"dashboards.{module_name}")
-                        print(f"Successfully imported {module_name}, registry now has {len(registry.dashboards)} dashboards")
-                    except ImportError as e:
-                        print(f"Failed to import {module_name}: {e}")
-                        # Continue with other modules even if one fails
-                        continue
-                    except Exception as e:
-                        print(f"Error importing {module_name}: {e}")
-                        continue
-        else:
-            print(f"Dashboard directory does not exist: {dashboards_dir}")
-            return {'error': f'Dashboard directory not found: {dashboards_dir}'}
-        
-        dashboards = []
-        for name, dashboard in registry.dashboards.items():
-            dashboards.append({
-                'name': name,
-                'filters': dashboard.filters,
-                'table': dashboard.table,
-                'score_metric': dashboard.score_metric,
-                'step': dashboard.step
-            })
-        
-        print(f"Returning {len(dashboards)} dashboards: {[d['name'] for d in dashboards]}")
-        return {'dashboards': dashboards}
-    
-    except Exception as e:
-        import traceback
-        error_msg = f"Error in get_dashboards: {str(e)}\n{traceback.format_exc()}"
-        print(error_msg)
-        return {'error': error_msg}
+    """Return a minimal local dashboard definition so UI can proceed without W&B."""
+    return {'dashboards': [
+        {
+            'name': 'Local',
+            'filters': {},
+            'table': 'eval_metrics.csv',
+            'score_metric': 'loss',
+            'step': 'step',
+        }
+    ]}
 
 @app.post("/api/dashboard/analyze")
 def analyze_run_with_dashboard(request: Dict[str, Any]):
     print(f"Analyzing run with dashboard: {request}")
-    """Analyze a W&B run using a specific dashboard."""
+    """Analyze a local run: return plot metadata from metrics.csv and no tables by default."""
     try:
         run_id = request.get('run_id')
         dashboard_name = request.get('dashboard_name')
-        
-        # Get entity and project from environment variables
-        entity = os.getenv('WANDB_ENTITY', 'hazy-research')
-        project = os.getenv('WANDB_PROJECT', 'cartridges')
-        
         if not all([run_id, dashboard_name]):
             raise HTTPException(status_code=400, detail="run_id and dashboard_name are required")
-        
-        # Import wandb and dashboard registry
-        import wandb
-        try:
-            from dashboards.base import registry
-            
-            # Dynamically import all dashboard modules to ensure they're registered
-            dashboards_dir = os.path.join(os.path.dirname(__file__), '..', 'dashboards')
-            dashboards_dir = os.path.abspath(dashboards_dir)
-            
-            if os.path.exists(dashboards_dir):
-                for filename in os.listdir(dashboards_dir):
-                    if filename.endswith('.py') and filename not in ['__init__.py', 'base.py']:
-                        module_name = filename[:-3]  # Remove .py extension
-                        try:
-                            importlib.import_module(module_name)
-                        except Exception:
-                            # Ignore import errors for individual modules
-                            pass
-        except ImportError as e:
-            print(f"Failed to import dashboard registry: {str(e)}") 
-            return {'error': f'Failed to import dashboard registry: {str(e)}'}
-        
-        # Get the dashboard
-        if dashboard_name not in registry.dashboards:
-            raise HTTPException(status_code=404, detail=f"Dashboard '{dashboard_name}' not found")
-        
-        dashboard = registry.dashboards[dashboard_name]
-        
-        # Initialize wandb API
-        try:
-            api = wandb.Api()
-        except Exception as e:
-            print(f"Failed to initialize W&B API: {str(e)}")
-            return {'error': f'Failed to initialize W&B API. Make sure WANDB_API_KEY is set: {str(e)}'}
-        
-        # Get the run
-        run = api.run(f"{entity}/{project}/{run_id}")
-        
-        # Get table specs from dashboard (plots will be loaded separately)
-        table_specs = dashboard.tables(run)
-        
-        # Just get plot metadata, not the actual data
-        plot_specs_meta = []
-        try:
-            # Get plot specs but don't materialize the data yet
-            plots_specs = dashboard.plots(run)
-            for plot_spec in plots_specs:
-                plot_specs_meta.append({
-                    'id': plot_spec.id,
-                    'plot_name': plot_spec.plot_name,
-                    'x_col': plot_spec.x_col,
-                    'y_col': plot_spec.y_col,
-                    # 'data' will be loaded asynchronously
-                })
-        except Exception as e:
-            print(f"Error getting plot specs: {e}")
-            plot_specs_meta = []
-        
-        # Serialize table specs (metadata only, no data)
-        tables = []
-        for table_spec in table_specs:
-            tables.append({
-                'step': table_spec.step,
-                'score_col': table_spec.score_col,
-                'answer_col': table_spec.answer_col,
-                'prompt_col': table_spec.prompt_col,
-                'pred_col': table_spec.pred_col,
-                'path': table_spec.path,  # Include path for later data loading
-                # 'data' will be loaded on-demand via separate endpoint
+        # Build plot metadata by inspecting local CSVs
+        run_dir = Path(OUTPUTS_ROOT) / run_id
+        plots_meta = []
+        metrics_path = run_dir / 'metrics.csv'
+        eval_path = run_dir / 'eval_metrics.csv'
+        if metrics_path.exists():
+            plots_meta.append({
+                'id': 'local/loss',
+                'plot_name': 'Training Loss',
+                'x_col': 'step',
+                'y_col': 'loss',
             })
-        
+            # Training perplexity (if present)
+            try:
+                df_head = pd.read_csv(metrics_path, nrows=1)
+                if 'perplexity' in df_head.columns:
+                    plots_meta.append({
+                        'id': 'local/ppl',
+                        'plot_name': 'Training Perplexity',
+                        'x_col': 'step',
+                        'y_col': 'perplexity',
+                    })
+            except Exception:
+                pass
+        if eval_path.exists():
+            try:
+                df_eval = pd.read_csv(eval_path)
+                if 'eval_name' in df_eval.columns:
+                    for name in sorted(df_eval['eval_name'].dropna().unique()):
+                        plots_meta.append({
+                            'id': f'eval/{name}',
+                            'plot_name': f'Eval: {name}',
+                            'x_col': 'step',
+                            'y_col': 'loss',
+                        })
+                        # Add eval perplexity plot if available
+                        if 'perplexity' in df_eval.columns:
+                            plots_meta.append({
+                                'id': f'eval_ppl/{name}',
+                                'plot_name': f'Perplexity: {name}',
+                                'x_col': 'step',
+                                'y_col': 'perplexity',
+                            })
+            except Exception:
+                pass
         return {
-            'plots': plot_specs_meta,
-            'tables': tables,
+            'plots': plots_meta,
+            'tables': [],
             'dashboard_name': dashboard_name,
             'run_id': run_id
         }
@@ -727,194 +622,123 @@ def get_table_data(request: Dict[str, Any]):
 
 @app.post("/api/dashboard/plots")
 def get_plot_data(request: Dict[str, Any]):
-    """Load plot data for a dashboard and run."""
+    """Load plot data from local CSVs for a run (training, lr, evals)."""
     try:
         run_id = request.get('run_id')
         dashboard_name = request.get('dashboard_name')
-        
-        # Get entity and project from environment variables
-        entity = os.getenv('WANDB_ENTITY', 'hazy-research')
-        project = os.getenv('WANDB_PROJECT', 'cartridges')
-        
         if not all([run_id, dashboard_name]):
             raise HTTPException(status_code=400, detail="run_id and dashboard_name are required")
-        
-        # Import wandb and dashboard registry
-        import wandb
-        try:
-            from dashboards.base import registry
-            
-            # Dynamically import all dashboard modules to ensure they're registered
-            dashboards_dir = os.path.join(os.path.dirname(__file__), 'dashboards')
-            dashboards_dir = os.path.abspath(dashboards_dir)
-            
-            if os.path.exists(dashboards_dir):
-                for filename in os.listdir(dashboards_dir):
-                    if filename.endswith('.py') and filename not in ['__init__.py', 'base.py']:
-                        module_name = filename[:-3]  # Remove .py extension
-                        try:
-                            importlib.import_module(f"dashboards.{module_name}")
-                        except Exception:
-                            # Ignore import errors for individual modules
-                            pass
-        except ImportError as e:
-            print(f"Failed to import dashboard registry: {str(e)}") 
-            return {'error': f'Failed to import dashboard registry: {str(e)}'}
-        
-        # Get the dashboard
-        if dashboard_name not in registry.dashboards:
-            raise HTTPException(status_code=404, detail=f"Dashboard '{dashboard_name}' not found")
-        
-        dashboard = registry.dashboards[dashboard_name]
-        
-        # Initialize wandb API
-        try:
-            api = wandb.Api()
-        except Exception as e:
-            print(f"Failed to initialize W&B API: {str(e)}")
-            return {'error': f'Failed to initialize W&B API. Make sure WANDB_API_KEY is set: {str(e)}'}
-        
-        # Get the run
-        run = api.run(f"{entity}/{project}/{run_id}")
-        
-        # Get and serialize plot specs with data
-        plots_specs = dashboard.plots(run)
+        run_dir = Path(OUTPUTS_ROOT) / run_id
+        metrics_path = run_dir / 'metrics.csv'
+        eval_path = run_dir / 'eval_metrics.csv'
         plots = []
-        for plot_spec in plots_specs:
-            # Handle NaN values in plot data
-            plot_df = plot_spec.df.fillna('')  # Replace NaN with empty strings
-            
-            plots.append({
-                'id': plot_spec.id,
-                'plot_name': plot_spec.plot_name,
-                'x_col': plot_spec.x_col,
-                'y_col': plot_spec.y_col,
-                'data': plot_df.to_dict('records')  # Convert DataFrame to JSON
-            })
-        
-        return {
-            'plots': plots,
-            'dashboard_name': dashboard_name,
-            'run_id': run_id
-        }
+        # Training loss
+        if metrics_path.exists():
+            try:
+                df = pd.read_csv(metrics_path).fillna('')
+                if {'step','loss'}.issubset(df.columns):
+                    plots.append({
+                        'id': 'local/loss',
+                        'plot_name': 'Training Loss',
+                        'x_col': 'step',
+                        'y_col': 'loss',
+                        'data': df[['step','loss']].to_dict('records')
+                    })
+                if {'step','perplexity'}.issubset(df.columns):
+                    plots.append({
+                        'id': 'local/ppl',
+                        'plot_name': 'Training Perplexity',
+                        'x_col': 'step',
+                        'y_col': 'perplexity',
+                        'data': df[['step','perplexity']].to_dict('records')
+                    })
+            except Exception as e:
+                return {'error': f'Failed to read metrics: {e}'}
+        # Eval plots (holdout, replay, etc.)
+        if eval_path.exists():
+            try:
+                df_eval = pd.read_csv(eval_path).fillna('')
+                if {'step','eval_name','loss'}.issubset(df_eval.columns):
+                    for name in sorted(df_eval['eval_name'].dropna().unique()):
+                        sub = df_eval[df_eval['eval_name'] == name]
+                        plots.append({
+                            'id': f'eval/{name}',
+                            'plot_name': f'Eval: {name}',
+                            'x_col': 'step',
+                            'y_col': 'loss',
+                            'data': sub[['step','loss']].to_dict('records')
+                        })
+                        if {'perplexity'}.issubset(sub.columns):
+                            plots.append({
+                                'id': f'eval_ppl/{name}',
+                                'plot_name': f'Perplexity: {name}',
+                                'x_col': 'step',
+                                'y_col': 'perplexity',
+                                'data': sub[['step','perplexity']].to_dict('records')
+                            })
+            except Exception as e:
+                return {'error': f'Failed to read eval metrics: {e}'}
+        return {'plots': plots, 'dashboard_name': dashboard_name, 'run_id': run_id}
         
     except Exception as e:
         print(f"Error in get_plot_data: {str(e)}")
         return {'error': str(e)}
 
-@app.post("/api/wandb/runs")
-def get_wandb_runs(request: Dict[str, Any]):
-    """Fetch W&B runs using the Python API."""
-    print("Fetching W&B runs...")
+@app.get('/api/local/runs')
+def list_local_runs(root: Optional[str] = None):
+    """List local runs by scanning OUTPUTS_ROOT (or provided root) for subdirectories with metrics.csv."""
+    base = Path(root or OUTPUTS_ROOT)
+    runs = []
+    if not base.exists():
+        return {'runs': [], 'root': str(base)}
+
+    # Collect all directories that contain metrics.csv or eval_metrics.csv at any depth
+    run_dirs = set()
+    for metrics_file in base.rglob('metrics.csv'):
+        run_dirs.add(metrics_file.parent)
+    for eval_file in base.rglob('eval_metrics.csv'):
+        run_dirs.add(eval_file.parent)
+
+    for run_dir in run_dirs:
+        metrics_path = run_dir / 'metrics.csv'
+        eval_path = run_dir / 'eval_metrics.csv'
+        # Use relative path from base as stable ID (handles nested date/uuid structure)
+        try:
+            rel_id = str(run_dir.relative_to(base))
+        except ValueError:
+            rel_id = run_dir.name
+        runs.append({
+            'id': rel_id,
+            'name': run_dir.name,
+            'path': str(run_dir),
+            'createdAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(run_dir.stat().st_mtime)),
+            'has_metrics': metrics_path.exists(),
+            'has_eval': eval_path.exists(),
+        })
+
+    # sort by mtime desc
+    runs.sort(key=lambda r: r['createdAt'], reverse=True)
+    return {'runs': runs, 'root': str(base)}
+
+@app.get('/api/local/metrics')
+def get_local_metrics(run_id: str, root: Optional[str] = None):
+    """Return metrics.csv and eval_metrics.csv contents as JSON arrays."""
+    base = Path(root or OUTPUTS_ROOT) / run_id
+    result: Dict[str, Any] = {'run_id': run_id, 'root': str(base)}
     try:
-        # Get entity and project from environment variables
-        entity = os.getenv('WANDB_ENTITY', 'hazy-research')
-        project = os.getenv('WANDB_PROJECT', 'cartridges')
-        filters = request.get('filters', {})
-        tag_filter = filters.get('tag', '').strip()
-        run_id_filter = filters.get('run_id', '').strip()
-        dashboard_filters = request.get('dashboard_filters', {})
-        page = request.get('page', 0)
-        per_page = request.get('per_page', 8)
-        
-        # Try to import wandb
-        try:
-            import wandb
-        except ImportError:
-            return {'error': 'wandb package not installed. Please install with: pip install wandb'}
-        
-        # Initialize wandb API (uses WANDB_API_KEY environment variable)
-        try:
-            api = wandb.Api()
-        except Exception as e:
-            return {'error': f'Failed to initialize W&B API. Make sure WANDB_API_KEY is set: {str(e)}'}
-        
-        # Fetch runs from the project
-        try:
-            # Build filters dictionary for W&B API
-            wandb_filters = {}
-            
-            # Apply user-specified filters
-            if tag_filter:
-                wandb_filters["tags"] = {"$in": [tag_filter]}
-            if run_id_filter:
-                wandb_filters["name"] = {"$regex": run_id_filter}
-            
-            # Apply dashboard-specific filters (dict format)
-            if isinstance(dashboard_filters, dict):
-                for key, value in dashboard_filters.items():
-                    if key and value:
-                        # Apply dashboard filters directly - they should already be in W&B filter format
-                        wandb_filters[key] = value
-            
-            print(f"Applying filters: {wandb_filters}, page: {page}, per_page: {per_page}")
-            
-            # Get all runs to check total count
-            all_runs = api.runs(f"{entity}/{project}", filters=wandb_filters, order="-created_at")
-            total_count = len(list(all_runs))
-            
-            # Get paginated runs
-            runs = api.runs(f"{entity}/{project}", per_page=per_page, filters=wandb_filters, order="-created_at")
-            
-            # Skip to the correct page
-            runs_list = list(runs)
-            start_idx = page * per_page
-            end_idx = start_idx + per_page
-            paginated_runs = runs_list[start_idx:end_idx]
-            
-            # Convert runs to JSON-serializable format
-            runs_data = []
-            for run in paginated_runs:
-                print(f"Processing run {run.id}")
-                try:
-                    # Safely serialize config and summary to handle complex objects
-                    def serialize_dict(d):
-                        """Recursively serialize dictionary to handle complex objects."""
-                        if not isinstance(d, dict):
-                            return str(d) if d is not None else None
-                        
-                        result = {}
-                        for key, value in d.items():
-                            if isinstance(value, dict):
-                                result[key] = serialize_dict(value)
-                            elif isinstance(value, (list, tuple)):
-                                result[key] = [serialize_dict(item) if isinstance(item, dict) else str(item) for item in value]
-                            elif hasattr(value, '__dict__'):
-                                # Convert objects to string representation
-                                result[key] = str(value)
-                            else:
-                                result[key] = value
-                        return result
-                    
-                    run_data = {
-                        'id': run.id,
-                        'name': run.name or run.id,
-                        'state': run.state,
-                        'createdAt': run.created_at,
-                        'config': serialize_dict(dict(run.config)) if run.config else {},
-                        'summary': serialize_dict(dict(run.summary)) if run.summary else {},
-                        'tags': list(run.tags) if run.tags else [],
-                        'url': run.url
-                    }
-                    runs_data.append(run_data)
-                except Exception as e:
-                    print(f"Error processing run {run.id}: {e}")
-                    continue
-            
-            print(f"Fetched {len(runs_data)} runs (page {page}, total available: {total_count})")
-            return {
-                'runs': runs_data,
-                'total': total_count,
-                'page': page,
-                'per_page': per_page,
-                'has_more': end_idx < total_count
-            }
-            
-        except Exception as e:
-            return {'error': f'Failed to fetch runs from {entity}/{project}: {str(e)}'}
-    
+        if (base / 'metrics.csv').exists():
+            df = pd.read_csv(base / 'metrics.csv')
+            result['metrics'] = df.to_dict('records')
+        else:
+            result['metrics'] = []
+        if (base / 'eval_metrics.csv').exists():
+            df_eval = pd.read_csv(base / 'eval_metrics.csv')
+            result['eval_metrics'] = df_eval.to_dict('records')
+        else:
+            result['eval_metrics'] = []
+        return result
     except Exception as e:
-        return {'error': str(e)}
+        return {'error': str(e), 'run_id': run_id, 'root': str(base)}
 
 @app.post("/api/dashboard/slices")
 def get_table_slices(request: Dict[str, Any]):

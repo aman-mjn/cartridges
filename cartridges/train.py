@@ -2,9 +2,11 @@ from __future__ import annotations
 from abc import ABCMeta, abstractmethod
 import contextlib
 from dataclasses import dataclass, field
+import itertools
 import math
 from math import cos, pi
 import os
+import shutil
 from pathlib import Path
 import re
 import time
@@ -24,7 +26,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
-import wandb
+
 
 from cartridges.cache import AttnConfig, KVCacheFactory, TrainableCache
 from cartridges.datasets import (
@@ -36,7 +38,7 @@ from cartridges.datasets import (
 )
 from cartridges.models.config import ModelConfig
 from cartridges.utils import get_logger, seed_everything
-from cartridges.utils.wandb import WandBConfig, prepare_wandb
+
 
 
 logger = get_logger(__name__)
@@ -44,12 +46,12 @@ logger = get_logger(__name__)
 
 class LossEvalConfig(BaseConfig):
     dataset: LossEvalDataset.Config | TrainDataset.Config
-    name_for_wandb: str
+    name: str
 
 class GenerationEvalConfig(BaseConfig):
     dataset: GenerateEvalDataset.Config
 
-    name_for_wandb: str
+    name: str
     generate_max_new_tokens: int = 128
     dataloader_num_workers: int = 0
     num_samples: int = 1
@@ -60,11 +62,11 @@ class GenerationEvalConfig(BaseConfig):
 
 
 class TrainConfig(RunConfig):
-    name: str = "default"  # A name for the run for wandb
+    name: str = "default"  # A name for the run
     output_dir: str = os.environ.get("CARTRIDGES_OUTPUT_DIR", ".")
 
     model: ModelConfig
-    wandb: Optional[WandBConfig] = Field(default_factory=WandBConfig)
+
     dataset: TrainDataset.Config
 
     # datasets for evaluating perplexity on other generations
@@ -105,7 +107,7 @@ class TrainConfig(RunConfig):
     save_every_n_steps: Optional[int] = 512
     save_after_training: bool = True
     keep_last_n_saved: int = 1
-    save_to_wandb: bool = True
+
     log_time: bool = False
 
     max_optimizer_steps: int = -1
@@ -148,6 +150,12 @@ def train(config: TrainConfig):
     logger.info(f"Num devices: {num_devices}")
 
     logger.info(f"Train outputs will be saved to {config.run_dir}")
+
+    # Ensure run directory exists and prepare metrics file paths
+    run_dir_path = Path(config.run_dir)
+    run_dir_path.mkdir(parents=True, exist_ok=True)
+    metrics_csv_path = run_dir_path / "metrics.csv"
+    eval_metrics_csv_path = run_dir_path / "eval_metrics.csv"
     tokenizer = AutoTokenizer.from_pretrained(config.model.pretrained_model_name_or_path)    
 
     t0 = time.time()
@@ -261,12 +269,9 @@ def train(config: TrainConfig):
 
     logger.info("Starting training")
 
-    # Only set up W&B if rank 0 or running single-process
-    if config.wandb is not None and is_rank_zero:
-        config.wandb.name = config.name
-        prepare_wandb(config.wandb, config.to_dict())
-
-        wandb_log_dict = {
+    # Log model statistics
+    if is_rank_zero:
+        model_stats = {
             "num_model_params": sum(p.numel() for p in wrapped_model.parameters()),
             "num_trainable_params": sum(
                 p.numel() for p in wrapped_model.parameters() if p.requires_grad
@@ -274,7 +279,7 @@ def train(config: TrainConfig):
         }
 
         if cache_tuning:
-            wandb_log_dict.update(
+            model_stats.update(
                 {
                     "num_trainable_tokens": cache._num_trainable_tokens,
                     "cache_trainable_params": sum(
@@ -283,14 +288,7 @@ def train(config: TrainConfig):
                 }
             )
 
-        wandb.log(
-            wandb_log_dict,
-            # SE (03/10): by setting commit=False, we avoid incrementing the step count
-            # to 1. Without this, the first evaluation at step 0 will not be logged
-            commit=False,
-        )
-
-        logger.info(f"Setup wandb with model stats: {wandb_log_dict}")
+        logger.info(f"Model stats: {model_stats}")
 
 
     def do_evaluation():
@@ -307,6 +305,10 @@ def train(config: TrainConfig):
                 cache_tuning=cache_tuning,
             )
 
+    # Simple replay buffer: sample and cache a small set of early batches for forgetting checks
+    replay_examples: list[DatasetBatch] = []
+    max_replay = 64  # number of elements to keep for replay eval
+
     def do_evaluate_generations(step: int = None, final: bool = False):
         for eval_config, generate_dataset in generate_evals:
             evaluate_generations(
@@ -318,7 +320,7 @@ def train(config: TrainConfig):
                 local_rank=local_rank,
                 step=step,
                 final=final,
-                log_to_wandb=config.wandb is not None,
+                log_to_console=True,
             )
 
     if config.lr_scheduler is not None:
@@ -342,6 +344,11 @@ def train(config: TrainConfig):
             batch: DatasetBatch
             do_step = (iter_idx + 1) % accumulate_grad_steps == 0
 
+            # Populate replay buffer early in training
+            if len(replay_examples) < max_replay:
+                # store a lightweight copy on CPU
+                replay_examples.append(batch)
+
             if (
                 config.loss_eval_every_n_steps is not None
                 and optimizer_step % config.loss_eval_every_n_steps == 0
@@ -349,6 +356,40 @@ def train(config: TrainConfig):
                 == 0  # only on the first batch of each optimizer step
             ):
                 do_evaluation()
+
+                # Replay evaluation to detect forgetting
+                if is_rank_zero and len(replay_examples) > 0:
+                    with torch.no_grad():
+                        total_loss = 0.0
+                        denom = 0
+                        for ex in replay_examples:
+                            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                out = wrapped_model(
+                                    input_ids=ex.input_ids.to(local_rank),
+                                    seq_ids=ex.element_ids.to(local_rank),
+                                    position_ids=ex.position_ids.to(local_rank),
+                                )
+                                pred_logprobs = F.log_softmax(out.logits, dim=-1)[
+                                    0,
+                                    ex.topk_token_idxs.to(local_rank) - 1,
+                                    ex.topk_token_ids.to(local_rank),
+                                ]
+                                ce = -(ex.topk_logprobs.to(local_rank).exp() * pred_logprobs)
+                                total_loss += ce.mean().item()
+                                denom += 1
+                        if denom > 0:
+                            replay_loss = total_loss / denom
+                            # Append replay metrics to eval CSV
+                            try:
+                                if not (run_dir_path / "eval_metrics.csv").exists():
+                                    with open(run_dir_path / "eval_metrics.csv", "w") as f:
+                                        f.write("step,epoch,eval_name,loss,perplexity,wall_time\n")
+                                with open(run_dir_path / "eval_metrics.csv", "a") as f:
+                                    f.write(
+                                        f"{optimizer_step},{epoch_idx},replay,{replay_loss:.6f},{math.exp(replay_loss):.6f},{time.time():.3f}\n"
+                                    )
+                            except Exception as _e:
+                                logger.debug(f"Failed to write replay eval CSV: {_e}")
 
             
             if (
@@ -438,27 +479,29 @@ def train(config: TrainConfig):
                     }
                 )
 
-            if config.wandb is not None and is_rank_zero and do_step:
+            if is_rank_zero and do_step:
                 total_num_input_tokens += accum_num_input_tokens.item()
                 total_num_target_tokens += accum_num_target_tokens.item()
-                wandb.log(
-                    {
-                        "train/loss": accum_loss,
-                        "train/perplexity": torch.exp(accum_loss).item(),
-                        "train/epoch_idx": epoch_idx,
-                        "train/optimizer_step": optimizer_step,
-                        "train/iter_idx": iter_idx,
-                        "train/step_num_input_tokens": accum_num_input_tokens,
-                        "train/step_num_target_tokens": accum_num_target_tokens,
-                        "train/num_input_tokens": total_num_input_tokens,
-                        "train/num_target_tokens": total_num_target_tokens,
-                        **{
-                            f"optimizer/lr_group{i}": param_group["lr"]
-                            for i, param_group in enumerate(optimizer.param_groups)
-                        },
-                    },
-                    step=optimizer_step,
+                # Log training metrics to console instead of wandb
+                logger.info(
+                    f"Step {optimizer_step}: loss={accum_loss:.4f}, "
+                    f"ppl={torch.exp(accum_loss).item():.2f}, "
+                    f"lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
+
+                # Append training metrics to CSV for simple UI consumption
+                try:
+                    if not metrics_csv_path.exists():
+                        with open(metrics_csv_path, "w") as f:
+                            f.write("step,loss,perplexity,lr,epoch,iter,wall_time\n")
+                    with open(metrics_csv_path, "a") as f:
+                        f.write(
+                            f"{optimizer_step},{accum_loss.item():.6f},{torch.exp(accum_loss).item():.6f},"
+                            f"{optimizer.param_groups[0]['lr']:.8f},{epoch_idx},{iter_idx},{time.time():.3f}\n"
+                        )
+                except Exception as _e:
+                    # Avoid breaking training on logging failure
+                    logger.debug(f"Failed to write metrics CSV: {_e}")
 
             if (
                 config.save_every_n_steps is not None
@@ -509,8 +552,7 @@ def train(config: TrainConfig):
     if is_ddp:
         dist.barrier()
 
-    if config.wandb is not None and is_rank_zero:
-        wandb.finish()
+
 
 
 def evaluate_perplexity(
@@ -530,8 +572,13 @@ def evaluate_perplexity(
     world_size = dist.get_world_size() if is_ddp else 1
 
     logger.info(
-        f"Evaluating `{ds_config.name_for_wandb}` (n={len(eval_dataset)}, {len(eval_dataset) // world_size} per device, world size={world_size})"
+        f"Evaluating `{ds_config.name}` (n={len(eval_dataset)}, {len(eval_dataset) // world_size} per device, world size={world_size})"
     )
+
+    # Prepare eval logging path
+    run_dir = Path(config.run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    eval_metrics_csv_path = run_dir / "eval_metrics.csv"
 
     sampler = DistributedSampler(eval_dataset)if is_ddp else None
     dataloader = DataLoader(
@@ -549,12 +596,12 @@ def evaluate_perplexity(
     dataloader_pbar = tqdm(
         dataloader,
         total=len(dataloader),
-        desc=f"Evaluation [step={optimizer_step}] ({ds_config.name_for_wandb})",
+        desc=f"Evaluation [step={optimizer_step}] ({ds_config.name})",
         leave=False,
         disable=not is_rank_zero,
     )
 
-    prefix = f"eval_{ds_config.name_for_wandb}"
+    prefix = f"eval_{ds_config.name}"
 
     results = []
     with torch.no_grad():
@@ -585,7 +632,7 @@ def evaluate_perplexity(
                 )
 
                 epoch_loss += (ce_by_token.sum())
-                epoch_denom += ce_by_token.shape[0]
+                epoch_denom += batch.input_ids.shape[0]
 
             if cache_tuning:
                 assert cache is not None
@@ -611,7 +658,10 @@ def evaluate_perplexity(
         results = [item for sublist in gathered_results for item in sublist]
 
 
-    if config.wandb is not None and is_rank_zero:
+    if is_rank_zero:
+        eval_loss = epoch_loss / epoch_denom
+        eval_perplexity = math.exp(eval_loss)
+        
         if results:
             elem_losses = [item["loss"] for item in results]
             macro_loss = sum(elem_losses) / len(elem_losses)
@@ -620,23 +670,31 @@ def evaluate_perplexity(
             macro_loss = None
             macro_perplexity = None
 
-        wandb.log(
-            {
-                f"{prefix}/loss": epoch_loss / epoch_denom,
-                f"{prefix}/perplexity": math.exp(epoch_loss / epoch_denom),
-                f"{prefix}/macro_loss": macro_loss,
-                f"{prefix}/macro_perplexity": macro_perplexity,
-                f"{prefix}/table": pd.DataFrame(results),
-                f"{prefix}/num_system_and_user_tokens": epoch_num_system_and_user_tokens
-                / epoch_num_elements,
-                f"{prefix}/num_assistant_tokens": epoch_num_assistant_tokens
-                / epoch_num_elements,
-                f"{prefix}/num_elements": epoch_num_elements,
-            },
-            step=optimizer_step,
+        macro_loss_str = f"{macro_loss:.4f}" if macro_loss is not None else "N/A"
+        macro_ppl_str = f"{macro_perplexity:.2f}" if macro_perplexity is not None else "N/A"
+        logger.info(
+            f"Evaluation {prefix}: loss={eval_loss:.4f}, "
+            f"perplexity={eval_perplexity:.2f}, "
+            f"macro_loss={macro_loss_str}, "
+            f"macro_perplexity={macro_ppl_str}"
         )
 
-    logger.info("done evaling - " + ds_config.name_for_wandb)
+        # Append eval metrics to CSV
+        try:
+            if not eval_metrics_csv_path.exists():
+                with open(eval_metrics_csv_path, "w") as f:
+                    f.write("step,epoch,eval_name,loss,perplexity,wall_time\n")
+            with open(eval_metrics_csv_path, "a") as f:
+                f.write(
+                    f"{optimizer_step},{epoch}," \
+                    f"{ds_config.name},{(eval_loss.item() if hasattr(eval_loss, 'item') else float(eval_loss)):.6f}," \
+                    f"{(eval_perplexity if isinstance(eval_perplexity, float) else float(eval_perplexity)):.6f}," \
+                    f"{time.time():.3f}\n"
+                )
+        except Exception as _e:
+            logger.debug(f"Failed to write eval metrics CSV: {_e}")
+
+    logger.info("done evaling - " + ds_config.name)
 
     if is_ddp:
         # SE (05/03): this barrier is just to be safe, can probably be removed
@@ -654,7 +712,7 @@ def evaluate_generations(
     local_rank,
     step: int = None,
     final: bool = False,
-    log_to_wandb: bool = True,
+    log_to_console: bool = True,
 ):
     from cartridges.generation import flex_generate
 
@@ -671,12 +729,12 @@ def evaluate_generations(
         model = model.model
 
     logger.info(
-        f"Generating `{config.name_for_wandb}` (n={len(dataset)}, {len(dataset) // world_size} per device)"
+        f"Generating `{config.name}` (n={len(dataset)}, {len(dataset) // world_size} per device)"
     )
 
     has_score = hasattr(dataset, "score")
     has_batch_score = hasattr(dataset, "batch_score")
-    prefix = f"generate_{config.name_for_wandb}"
+    prefix = f"generate_{config.name}"
 
     if config.num_samples_final is not None and final:
         num_samples = config.num_samples_final
@@ -691,7 +749,7 @@ def evaluate_generations(
     results = []
     for batch_start in tqdm(
         range(0, len(indexes), batch_size),
-        desc=f"Generating [step={optimizer_step}] ({config.name_for_wandb})",
+        desc=f"Generating [step={optimizer_step}] ({config.name})",
         leave=False,
         disable=not is_rank_zero,
     ):
@@ -804,24 +862,14 @@ def evaluate_generations(
         score_cols = [col for col in df.columns if col.endswith("score")]
         avg_scores = {f"{prefix}/{col}": df[col].mean() for col in score_cols}
 
-        if log_to_wandb:
-            log_dict = {
-                **avg_scores,
-                f"{prefix}/table": df,
-                f"{prefix}/num_system_and_user_tokens": df[
-                    "num_system_and_user_tokens"
-                ].mean(),
-                f"{prefix}/num_assistant_tokens": df["num_assistant_tokens"].mean(),
-            }
-            logger.info(avg_scores)
-
+        if log_to_console:
+            logger.info(f"Generation results for {prefix}:")
+            logger.info(f"Average scores: {avg_scores}")
+            logger.info(f"Avg system/user tokens: {df['num_system_and_user_tokens'].mean():.1f}")
+            logger.info(f"Avg assistant tokens: {df['num_assistant_tokens'].mean():.1f}")
+            
             if batch_score is not None:
-                log_dict[f"{prefix}/batch_score"] = batch_score
-
-            wandb.log(
-                log_dict,
-                step=optimizer_step,
-            )
+                logger.info(f"Batch score: {batch_score}")
 
     if is_ddp:
         dist.barrier()
@@ -914,12 +962,14 @@ class CacheAndModel(nn.Module):
         input_ids: torch.Tensor, 
         seq_ids: torch.Tensor, 
         position_ids: torch.Tensor,
+        # labels: torch.Tensor
     ):
 
         out = self.model(
             input_ids=input_ids,
             seq_ids=seq_ids,
             position_ids=position_ids,
+            # labels=labels,
             use_cache=True,
             past_key_values=self.cache
         )
@@ -937,7 +987,6 @@ def save_cache(config: TrainConfig, cache: TrainableCache, optimizer_step: int):
 
     The cache is saved to {config.run_dir}/cache-step{step}.pt.
     Only keeps the most recent config.keep_last_n_saved checkpoints.
-    If config.save_to_wandb is True, also saves the cache to wandb.
     """
     run_dir = Path(config.run_dir)
     run_dir.mkdir(exist_ok=True, parents=True)
@@ -947,19 +996,13 @@ def save_cache(config: TrainConfig, cache: TrainableCache, optimizer_step: int):
 
     cache.save(save_path)
 
-    # Create/update symlink to latest checkpoint
-    symlink_path = os.path.join(config.run_dir, "cache_last.pt")
-    if os.path.exists(symlink_path) or os.path.islink(symlink_path):
-        os.remove(symlink_path)
-    os.symlink(save_path, symlink_path)
+    # Create/update a regular file copy for the latest checkpoint (no symlink)
+    last_cache_path = os.path.join(config.run_dir, "cache_last.pt")
+    if os.path.exists(last_cache_path) or os.path.islink(last_cache_path):
+        os.remove(last_cache_path)
+    shutil.copy2(save_path, last_cache_path)
 
-    # Save to wandb if configured
-
-    if config.save_to_wandb and config.wandb is not None:
-        logger.info(f"Saving cache to wandb: {filename}")
-        # by passing base_path, we save the files to the root of the wandb run
-        # instead of duplicating the full path including the run directory
-        wandb.save(save_path, base_path=config.run_dir, policy="now")
+    logger.info(f"Cache saved locally: {filename}")
 
     # Remove older saves if we exceed keep_last_n_saved
     pattern = r"^cache-epoch(\d+)\.pt$"
@@ -980,5 +1023,3 @@ def save_cache(config: TrainConfig, cache: TrainableCache, optimizer_step: int):
     while len(all_checkpoints) > config.keep_last_n_saved:
         oldest = all_checkpoints.pop(0)
         os.remove(os.path.join(config.run_dir, oldest))
-
-

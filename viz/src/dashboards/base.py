@@ -7,8 +7,7 @@ from typing import TYPE_CHECKING, Callable
 import pandas as pd
 
 
-import wandb
-from wandb.apis.public.runs import Run
+from typing import Any
 
 
 @dataclass
@@ -82,7 +81,7 @@ class Dashboard:
 
     def tables(
         self,
-        run: "wandb.Run",
+        run: Any,
     ) -> list[TableSpec]:
         t0 = time.time()
         
@@ -102,7 +101,7 @@ class Dashboard:
     
     def plots(
         self,
-        run: "wandb.Run",
+        run: Any,
     ) -> list[PlotSpec]:
         t0 = time.time()
         df = pd.DataFrame([
