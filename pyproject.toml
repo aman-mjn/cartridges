@@ -20,7 +20,8 @@ dependencies = [
     "tiktoken",
     "peft",
     "evaluate",
-    "markdown"
+    "markdown",
+    "matplotlib>=3.10.6",
 ]
 
 [project.scripts]
